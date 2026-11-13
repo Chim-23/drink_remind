@@ -1,0 +1,33 @@
+{
+  "enabled": true,
+  "weekdays_only": true,
+  "reminders": [
+    {
+      "time": "10:00",
+      "title": "喝水提醒",
+      "message": "半杯，约 275 毫升",
+      "enabled": true
+    },
+    {
+      "time": "11:30",
+      "title": "喝水提醒",
+      "message": "喝完剩下半杯，约 275 毫升",
+      "enabled": true
+    },
+    {
+      "time": "14:30",
+      "title": "喝水提醒",
+      "message": "重新装一杯，喝半杯，约 275 毫升",
+      "enabled": true
+    },
+    {
+      "time": "16:30",
+      "title": "喝水提醒",
+      "message": "喝完剩下半杯，约 275 毫升",
+      "enabled": true
+    }
+  ],
+  "auto_start": true,
+  "sound": true,
+  "snooze_minutes": 5
+}
