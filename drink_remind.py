@@ -115,6 +115,94 @@ def play_alert() -> None:
         pass
 
 
+def resource_path(name: str) -> Path | None:
+    """查找打包内 / 源码 assets 中的资源文件。"""
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        meipass = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+        candidates.extend(
+            [
+                meipass / "assets" / name,
+                meipass / name,
+                Path(sys.executable).resolve().parent / "assets" / name,
+                Path(sys.executable).resolve().parent / name,
+            ]
+        )
+    base = app_dir()
+    candidates.extend([base / "assets" / name, base / name])
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def clean_icon_alpha(img: "Image.Image", threshold: int = 10):
+    """去掉半透明白边/毛边，确保背景全透明。"""
+    from PIL import Image
+
+    img = img.convert("RGBA")
+    pixels = img.load()
+    w, h = img.size
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = pixels[x, y]
+            if a <= threshold:
+                pixels[x, y] = (0, 0, 0, 0)
+            elif r > 245 and g > 245 and b > 245 and a < 230:
+                pixels[x, y] = (0, 0, 0, 0)
+    return img
+
+
+def make_tray_image():
+    """托盘图标：透明底水滴，无白边。"""
+    from PIL import Image, ImageDraw
+
+    path = resource_path("tray_icon.png") or resource_path("app_icon.png")
+    if path is not None:
+        return clean_icon_alpha(Image.open(path)).resize((64, 64), Image.Resampling.LANCZOS)
+
+    # 兜底：程序内绘制透明水滴
+    scale = 4
+    size = 64 * scale
+    base = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(base)
+    cx, cy, r = size // 2, int(size * 0.42), int(size * 0.30)
+    draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=(31, 162, 166, 255))
+    draw.polygon(
+        [
+            (cx, int(size * 0.08)),
+            (cx - int(r * 0.92), cy - int(r * 0.15)),
+            (cx + int(r * 0.92), cy - int(r * 0.15)),
+        ],
+        fill=(31, 162, 166, 255),
+    )
+    hx, hy, hr = cx - int(r * 0.35), cy - int(r * 0.25), int(r * 0.22)
+    draw.ellipse((hx - hr, hy - hr, hx + hr, hy + hr), fill=(220, 245, 250, 230))
+    return clean_icon_alpha(base.resize((64, 64), Image.Resampling.LANCZOS))
+
+
+def apply_window_icon(root: tk.Tk) -> None:
+    """窗口/任务栏图标：优先 ICO，并保留 PhotoImage 引用防回收。"""
+    ico = resource_path("app_icon.ico")
+    if ico is not None:
+        try:
+            root.iconbitmap(default=str(ico))
+        except tk.TclError:
+            pass
+    png = resource_path("app_icon.png") or resource_path("tray_icon.png")
+    if png is None:
+        return
+    try:
+        from PIL import Image, ImageTk
+
+        im = clean_icon_alpha(Image.open(png)).resize((64, 64), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(im)
+        root.iconphoto(True, photo)
+        root._app_icon_photo = photo  # noqa: SLF001 — 防止被 GC
+    except Exception:
+        pass
+
+
 class OverlayReminder(tk.Toplevel):
     """霸屏提醒窗口：置顶、全屏、强制确认。"""
 
@@ -268,6 +356,8 @@ class DrinkRemindApp:
         self.root.configure(bg="#F4F8FB")
 
         self.overlay: OverlayReminder | None = None
+        self._tray = None
+        self._in_tray = False
         self._fired_keys: set[str] = set()
         self._snooze_until: datetime | None = None
         self._status_var = tk.StringVar(value="正在启动…")
@@ -279,11 +369,13 @@ class DrinkRemindApp:
         self._snooze_var = tk.StringVar(value=str(self.cfg.get("snooze_minutes", 5)))
 
         self._build_ui()
+        apply_window_icon(self.root)
+        self._setup_tray()
         self._sync_autostart()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(500, self._tick)
         self._refresh_next()
-        self._set_status("运行中 · 后台监听提醒计划")
+        self._set_status("运行中 · 关闭窗口后进入右下角托盘")
 
     def _build_ui(self) -> None:
         style = ttk.Style(self.root)
@@ -426,7 +518,7 @@ class DrinkRemindApp:
         # 底部编辑区先占位，避免被列表挤出屏幕
         tip = tk.Label(
             body,
-            text="用法：选中列表一行 → 调「时/分」→「应用时间并保存」；新增请先填时间/内容再点「新增一条」。关闭窗口仅最小化。",
+            text="用法：选中列表一行 → 调「时/分」→「应用时间并保存」。关闭后只留右下角托盘；右击托盘可选「打开应用 / 退出」。到点仅霸屏，不弹出本窗口。",
             font=("Microsoft YaHei UI", 9),
             bg="#F4F8FB",
             fg="#6A8796",
@@ -796,9 +888,14 @@ class DrinkRemindApp:
             threading.Thread(target=play_alert, daemon=True).start()
 
         snooze_minutes = int(self.cfg.get("snooze_minutes", 5) or 5)
+        # 到点提醒时不唤起主窗口；测试时若主窗口已打开则保持打开
+        keep_hidden = self._in_tray or not bool(self.root.winfo_viewable())
 
         def on_done() -> None:
             self.overlay = None
+            if keep_hidden:
+                self.root.withdraw()
+                self._in_tray = True
             if not is_test:
                 self._set_status("已确认喝水 · 继续监听")
             else:
@@ -806,11 +903,12 @@ class DrinkRemindApp:
 
         def on_snooze(minutes: int) -> None:
             self.overlay = None
+            if keep_hidden:
+                self.root.withdraw()
+                self._in_tray = True
             self._snooze_until = datetime.now() + timedelta(minutes=minutes)
             self._set_status(f"已延后 {minutes} 分钟再提醒")
 
-        self.root.deiconify()
-        self.root.lift()
         self.overlay = OverlayReminder(
             self.root,
             title=title,
@@ -819,6 +917,13 @@ class DrinkRemindApp:
             on_snooze=None if is_test else on_snooze,
             snooze_minutes=snooze_minutes,
         )
+        # 主窗口隐藏时，仍确保霸屏层可见
+        try:
+            self.overlay.deiconify()
+            self.overlay.lift()
+            self.overlay.focus_force()
+        except tk.TclError:
+            pass
 
     def _set_status(self, text: str) -> None:
         self._status_var.set(text)
@@ -931,27 +1036,84 @@ class DrinkRemindApp:
                 )
                 break
 
-    def _on_close(self) -> None:
-        # 最小化继续后台运行
-        self.root.iconify()
-        self._set_status("已最小化 · 后台继续提醒")
-
-    def quit_app(self) -> None:
-        if not messagebox.askyesno(APP_TITLE, "确定完全退出？退出后将不再提醒。"):
+    def _setup_tray(self) -> None:
+        try:
+            import pystray
+            from pystray import MenuItem as Item
+        except ImportError:
+            self._set_status("未安装托盘组件，关闭窗口将隐藏但无托盘图标")
             return
+
+        menu = pystray.Menu(
+            Item("打开应用", self._tray_show, default=True),
+            Item("测试霸屏提醒", self._tray_test),
+            Item("退出", self._tray_quit),
+        )
+        self._tray = pystray.Icon(APP_NAME, make_tray_image(), APP_TITLE, menu)
+        threading.Thread(target=self._tray.run, daemon=True).start()
+
+    def _tray_show(self, _icon=None, _item=None) -> None:
+        self.root.after(0, self._show_main)
+
+    def _tray_test(self, _icon=None, _item=None) -> None:
+        self.root.after(0, self.test_overlay)
+
+    def _tray_quit(self, _icon=None, _item=None) -> None:
+        self.root.after(0, self._quit_from_tray)
+
+    def _show_main(self) -> None:
+        self._in_tray = False
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+        self._set_status("运行中 · 关闭窗口后进入右下角托盘")
+
+    def _on_close(self) -> None:
+        # 隐藏主窗口：不占左侧任务栏，仅留右下角托盘
+        self.root.withdraw()
+        self._in_tray = True
+        self._set_status("已隐藏到托盘 · 后台继续提醒")
+
+    def _stop_tray(self) -> None:
+        if self._tray is not None:
+            try:
+                self._tray.stop()
+            except Exception:
+                pass
+            self._tray = None
+
+    def _force_quit(self) -> None:
         save_config(self.cfg)
         if self.overlay is not None and self.overlay.winfo_exists():
             try:
                 self.overlay.destroy()
             except tk.TclError:
                 pass
+        self._stop_tray()
         self.root.destroy()
+
+    def _quit_from_tray(self) -> None:
+        # 托盘退出：先短暂显示确认框
+        self.root.deiconify()
+        if messagebox.askyesno(APP_TITLE, "确定退出？退出后将不再提醒。"):
+            self._force_quit()
+        else:
+            if self._in_tray:
+                self.root.withdraw()
+
+    def quit_app(self) -> None:
+        if not messagebox.askyesno(APP_TITLE, "确定完全退出？退出后将不再提醒。"):
+            return
+        self._force_quit()
 
     def run(self) -> None:
         # 启动时确保配置落盘 & 自启动
         save_config(self.cfg)
         self._sync_autostart()
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            self._stop_tray()
 
 
 def main() -> None:

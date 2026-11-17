@@ -11,7 +11,12 @@ python -m PyInstaller --noconfirm --clean ^
   --onefile ^
   --windowed ^
   --name DrinkRemind ^
+  --icon "assets\app_icon.ico" ^
+  --hidden-import=pystray._win32 ^
+  --hidden-import=PIL._tkinter_finder ^
+  --collect-all pystray ^
   --add-data "config.json;." ^
+  --add-data "assets;assets" ^
   drink_remind.py
 if errorlevel 1 exit /b 1
 
